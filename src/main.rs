@@ -77,11 +77,24 @@ async fn run() -> Result<(), String> {
     let http_client = build_http_client(cli_args.proxy.as_deref())?;
     let auth = CopilotAuthenticator::new_with_client(
         AuthConfig {
-        token_dir,
-        github_api_key_url,
+            token_dir: token_dir.clone(),
+            github_api_key_url: github_api_key_url.clone(),
+            github_device_code_url: "https://github.com/login/device/code".to_string(),
+            github_access_token_url: "https://github.com/login/oauth/access_token".to_string(),
+            github_client_id: "Iv1.b507a08c87ecfe98".to_string(),
         },
         http_client.clone(),
     );
+    info!(
+        token_dir = %token_dir.display(),
+        github_api_key_url = %github_api_key_url,
+        "copilot auth configured"
+    );
+    auth
+        .get_api_key()
+        .await
+        .map_err(|e| format!("copilot auth preflight failed: {e}"))?;
+    info!("copilot auth preflight succeeded");
 
     let provider: Arc<dyn ApiKeyProvider> = Arc::new(RuntimeApiKeyProvider { auth });
     let app = build_proxy_router_with_client(

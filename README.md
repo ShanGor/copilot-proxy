@@ -7,6 +7,7 @@ Lightweight GitHub Copilot reverse proxy inspired by LiteLLM auth/header behavio
 - Rewrites `model` alias -> upstream Copilot model id.
 - Emulates VS Code/Copilot outbound headers.
 - Fetches Copilot API token using cached GitHub access token.
+- If token files are missing, runs GitHub device-code auth flow, stores tokens, then starts serving.
 - Reverse-proxies requests directly (no schema conversion).
 - Applies optional JSON-path transforms (`remove`, `add`, `replace`) on request payloads.
 

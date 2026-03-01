@@ -1,0 +1,7 @@
+[target.aarch64-apple-darwin]
+image = "ghcr.io/cross-rs/aarch64-apple-darwin:edge"
+
+[build.env]
+passthrough = [
+    "MACOSX_DEPLOYMENT_TARGET=11.0"
+]

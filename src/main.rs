@@ -116,11 +116,17 @@ async fn run() -> Result<(), String> {
 }
 
 fn build_http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
+    info!("TLS certificate verification is disabled for outbound requests");
     if let Some(proxy_url) = proxy {
+        // When --proxy is explicitly provided, do not let env proxy/NO_PROXY rules override it.
+        builder = builder.no_proxy();
         let proxy = reqwest::Proxy::all(proxy_url)
             .map_err(|e| format!("invalid --proxy value `{proxy_url}`: {e}"))?;
         builder = builder.proxy(proxy);
+        info!(proxy = %proxy_url, "outbound proxy enabled via --proxy");
+    } else {
+        info!("outbound proxy not explicitly set; reqwest env proxy behavior may apply");
     }
 
     builder

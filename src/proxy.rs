@@ -101,10 +101,12 @@ async fn proxy_handler(
     body: Bytes,
 ) -> Result<Response<Body>, StatusCode> {
     let mut outbound_body = body.to_vec();
-    let path = uri.path().to_string();
+    let incoming_path = uri.path().to_string();
+    let upstream_path = normalize_upstream_path(&incoming_path);
     let mut parsed_request_json: Option<Value> = None;
     debug!(
-        route = %path,
+        route = %incoming_path,
+        upstream_route = %upstream_path,
         method = %method,
         incoming_payload = %String::from_utf8_lossy(&outbound_body),
         "incoming request payload"
@@ -127,7 +129,7 @@ async fn proxy_handler(
             &mut json_body,
             &state.transforms,
             RequestContext {
-                route: &path,
+                route: &incoming_path,
                 model: incoming_model.as_deref(),
             },
         );
@@ -139,9 +141,13 @@ async fn proxy_handler(
     }
 
     let upstream_url = if let Some(q) = uri.query() {
-        format!("{}{}?{q}", state.upstream_base.trim_end_matches('/'), path)
+        format!(
+            "{}{}?{q}",
+            state.upstream_base.trim_end_matches('/'),
+            upstream_path
+        )
     } else {
-        format!("{}{}", state.upstream_base.trim_end_matches('/'), path)
+        format!("{}{}", state.upstream_base.trim_end_matches('/'), upstream_path)
     };
 
     let api_key = state
@@ -178,7 +184,8 @@ async fn proxy_handler(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     debug!(
-        route = %path,
+        route = %incoming_path,
+        upstream_route = %upstream_path,
         status = %status,
         response_payload = %String::from_utf8_lossy(&resp_bytes),
         "upstream response payload"
@@ -215,6 +222,14 @@ fn normalize_copilot_model_field(body: &mut Value) {
     };
     if let Some(stripped) = model.strip_prefix("github_copilot/") {
         obj.insert("model".to_string(), Value::String(stripped.to_string()));
+    }
+}
+
+fn normalize_upstream_path(path: &str) -> &str {
+    if path == "/v1/chat/completions" {
+        "/chat/completions"
+    } else {
+        path
     }
 }
 
@@ -297,7 +312,7 @@ mod tests {
         let last_body = Arc::new(Mutex::new(None));
         let last_headers = Arc::new(Mutex::new(None));
         let app = Router::new()
-            .route("/v1/chat/completions", post(upstream_handler))
+            .route("/chat/completions", post(upstream_handler))
             .with_state(UpstreamState {
                 last_body: last_body.clone(),
                 last_headers: last_headers.clone(),
@@ -425,5 +440,39 @@ model_list:
                 .and_then(|v| v.to_str().ok()),
             Some("true")
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_chat_completions_without_v1_prefix() {
+        let (upstream, _last_body, _last_headers) = start_upstream().await;
+        let yaml = r#"
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: github_copilot/gpt-4o-2024-11-20
+"#;
+        let config = AppConfig::from_yaml_str(yaml).expect("parse config");
+        let app = build_proxy_router(
+            config,
+            upstream,
+            vec![],
+            Arc::new(StaticApiKeyProvider::new("proxy-api-key")),
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string(),
+            ))
+            .expect("build request");
+
+        let res = app.oneshot(req).await.expect("proxy response");
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }

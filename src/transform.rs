@@ -57,12 +57,23 @@ fn rule_matches(rule: &TransformRule, ctx: RequestContext<'_>) -> bool {
         return true;
     };
 
-    let route_ok = when.route.as_deref().is_none_or(|r| r == ctx.route);
+    let route_ok = when
+        .route
+        .as_deref()
+        .is_none_or(|r| normalize_route(r) == normalize_route(ctx.route));
     let model_ok = when
         .model
         .as_deref()
         .is_none_or(|m| Some(m) == ctx.model);
     route_ok && model_ok
+}
+
+fn normalize_route(route: &str) -> &str {
+    if route == "/v1/chat/completions" {
+        "/chat/completions"
+    } else {
+        route
+    }
 }
 
 fn parse_path(path: &str) -> Option<Vec<PathToken>> {
@@ -308,5 +319,31 @@ mod tests {
         );
 
         assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn treats_chat_completions_routes_as_equivalent() {
+        let mut body = json!({"model": "gpt-4o", "stream": true});
+        let rules = vec![TransformRule {
+            when: Some(TransformWhen {
+                route: Some("/v1/chat/completions".to_string()),
+                model: Some("gpt-4o".to_string()),
+            }),
+            ops: vec![TransformOp::Replace {
+                path: "$.stream".to_string(),
+                value: json!(false),
+            }],
+        }];
+
+        apply_transforms(
+            &mut body,
+            &rules,
+            RequestContext {
+                route: "/chat/completions",
+                model: Some("gpt-4o"),
+            },
+        );
+
+        assert_eq!(body["stream"], json!(false));
     }
 }

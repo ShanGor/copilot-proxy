@@ -119,12 +119,13 @@ fn build_http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
     info!("TLS certificate verification is disabled for outbound requests");
     if let Some(proxy_url) = proxy {
+        let masked_proxy_url = mask_proxy_password(proxy_url);
         // When --proxy is explicitly provided, do not let env proxy/NO_PROXY rules override it.
         builder = builder.no_proxy();
         let proxy = reqwest::Proxy::all(proxy_url)
-            .map_err(|e| format!("invalid --proxy value `{proxy_url}`: {e}"))?;
+            .map_err(|e| format!("invalid --proxy value `{masked_proxy_url}`: {e}"))?;
         builder = builder.proxy(proxy);
-        info!(proxy = %proxy_url, "outbound proxy enabled via --proxy");
+        info!(proxy = %masked_proxy_url, "outbound proxy enabled via --proxy");
     } else {
         info!("outbound proxy not explicitly set; reqwest env proxy behavior may apply");
     }
@@ -132,6 +133,35 @@ fn build_http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     builder
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))
+}
+
+fn mask_proxy_password(proxy_url: &str) -> String {
+    if let Ok(mut parsed) = reqwest::Url::parse(proxy_url) {
+        if parsed.password().is_some() && parsed.set_password(Some("******")).is_ok() {
+            return parsed.to_string();
+        }
+        return proxy_url.to_string();
+    }
+
+    let Some(scheme_idx) = proxy_url.find("://") else {
+        return proxy_url.to_string();
+    };
+    let auth_start = scheme_idx + 3;
+    let Some(at_rel) = proxy_url[auth_start..].find('@') else {
+        return proxy_url.to_string();
+    };
+    let at_idx = auth_start + at_rel;
+    let credentials = &proxy_url[auth_start..at_idx];
+    let Some(colon_rel) = credentials.find(':') else {
+        return proxy_url.to_string();
+    };
+    let colon_idx = auth_start + colon_rel;
+    format!(
+        "{}{}{}",
+        &proxy_url[..=colon_idx],
+        "******",
+        &proxy_url[at_idx..]
+    )
 }
 
 fn resolve_config_path() -> PathBuf {
@@ -162,4 +192,21 @@ fn default_token_dir() -> PathBuf {
     }
 
     PathBuf::from(".copilot-tokens")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_proxy_password;
+
+    #[test]
+    fn masks_password_in_proxy_url() {
+        let masked = mask_proxy_password("http://user:secret@proxy.company.local:8080");
+        assert_eq!(masked, "http://user:******@proxy.company.local:8080/");
+    }
+
+    #[test]
+    fn leaves_proxy_without_password_unchanged() {
+        let url = "http://proxy.company.local:8080";
+        assert_eq!(mask_proxy_password(url), url);
+    }
 }

@@ -9,6 +9,7 @@ use axum::{
     response::Response,
     routing::any,
 };
+use futures_util::TryStreamExt;
 use serde_json::Value;
 use tracing::debug;
 
@@ -179,22 +180,42 @@ async fn proxy_handler(
     let upstream_resp = req.send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
-    let resp_bytes = upstream_resp
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    debug!(
-        route = %incoming_path,
-        upstream_route = %upstream_path,
-        status = %status,
-        response_payload = %String::from_utf8_lossy(&resp_bytes),
-        "upstream response payload"
-    );
+    let is_stream_request = parsed_request_json
+        .as_ref()
+        .and_then(|body| body.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_event_stream = is_event_stream_response(&resp_headers);
 
-    let mut response = Response::builder()
-        .status(status)
-        .body(Body::from(resp_bytes))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut response = if is_stream_request || is_event_stream {
+        debug!(
+            route = %incoming_path,
+            upstream_route = %upstream_path,
+            status = %status,
+            "streaming upstream response payload"
+        );
+        let stream = upstream_resp.bytes_stream().map_err(std::io::Error::other);
+        Response::builder()
+            .status(status)
+            .body(Body::from_stream(stream))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        let resp_bytes = upstream_resp
+            .bytes()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        debug!(
+            route = %incoming_path,
+            upstream_route = %upstream_path,
+            status = %status,
+            response_payload = %String::from_utf8_lossy(&resp_bytes),
+            "upstream response payload"
+        );
+        Response::builder()
+            .status(status)
+            .body(Body::from(resp_bytes))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
 
     let out_headers = response.headers_mut();
     for (name, value) in resp_headers {
@@ -211,6 +232,14 @@ async fn proxy_handler(
         HeaderValue::from_static("rust"),
     );
     Ok(response)
+}
+
+fn is_event_stream_response(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|content_type| content_type.to_ascii_lowercase().starts_with("text/event-stream"))
+        .unwrap_or(false)
 }
 
 fn normalize_copilot_model_field(body: &mut Value) {
@@ -272,16 +301,18 @@ mod tests {
     use std::{
         net::SocketAddr,
         sync::{Arc, Mutex},
+        time::{Duration, Instant},
     };
 
     use axum::{
         Json, Router,
-        body::Body,
+        body::{Body, Bytes},
         extract::State,
         http::{HeaderMap, Request, StatusCode},
-        response::IntoResponse,
+        response::{IntoResponse, Response},
         routing::post,
     };
+    use futures_util::{StreamExt, stream};
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
     use tower::util::ServiceExt;
@@ -305,7 +336,33 @@ mod tests {
     ) -> impl IntoResponse {
         *state.last_body.lock().expect("lock") = Some(body.clone());
         *state.last_headers.lock().expect("lock") = Some(headers);
-        (StatusCode::OK, Json(json!({"ok": true, "echo": body})))
+        if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            let chunks = vec![
+                "data: {\"delta\":\"a\"}\n\n",
+                "data: {\"delta\":\"b\"}\n\n",
+                "data: [DONE]\n\n",
+            ];
+            let sse = stream::unfold((0usize, chunks), |(idx, chunks)| async move {
+                if idx >= chunks.len() {
+                    None
+                } else {
+                    if idx > 0 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from(chunks[idx].to_string())),
+                        (idx + 1, chunks),
+                    ))
+                }
+            });
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(sse))
+                .expect("build sse response")
+                .into_response();
+        }
+        (StatusCode::OK, Json(json!({"ok": true, "echo": body}))).into_response()
     }
 
     async fn start_upstream() -> (String, Arc<Mutex<Option<Value>>>, Arc<Mutex<Option<HeaderMap>>>) {
@@ -313,6 +370,7 @@ mod tests {
         let last_headers = Arc::new(Mutex::new(None));
         let app = Router::new()
             .route("/chat/completions", post(upstream_handler))
+            .route("/v1/responses", post(upstream_handler))
             .with_state(UpstreamState {
                 last_body: last_body.clone(),
                 last_headers: last_headers.clone(),
@@ -442,6 +500,27 @@ model_list:
         );
     }
 
+    fn assert_common_copilot_headers(headers: &HeaderMap) {
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer proxy-api-key")
+        );
+        assert_eq!(
+            headers
+                .get("copilot-integration-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("vscode-chat")
+        );
+        assert_eq!(
+            headers
+                .get("editor-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("vscode/1.95.0")
+        );
+    }
+
     #[tokio::test]
     async fn forwards_chat_completions_without_v1_prefix() {
         let (upstream, _last_body, _last_headers) = start_upstream().await;
@@ -474,5 +553,186 @@ model_list:
 
         let res = app.oneshot(req).await.expect("proxy response");
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn applies_copilot_headers_for_chat_and_responses_endpoints() {
+        let (upstream, _last_body, last_headers) = start_upstream().await;
+        let yaml = r#"
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: github_copilot/gpt-4o-2024-11-20
+"#;
+        let config = AppConfig::from_yaml_str(yaml).expect("parse config");
+        let app = build_proxy_router(
+            config,
+            upstream,
+            vec![],
+            Arc::new(StaticApiKeyProvider::new("proxy-api-key")),
+        );
+
+        let chat_req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string(),
+            ))
+            .expect("build chat request");
+        let chat_res = app.clone().oneshot(chat_req).await.expect("chat response");
+        assert_eq!(chat_res.status(), StatusCode::OK);
+        let chat_headers = last_headers
+            .lock()
+            .expect("lock upstream headers")
+            .clone()
+            .expect("upstream should receive chat headers");
+        assert_common_copilot_headers(&chat_headers);
+
+        let responses_req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "gpt-4o",
+                    "input": "hello"
+                })
+                .to_string(),
+            ))
+            .expect("build responses request");
+        let responses_res = app
+            .oneshot(responses_req)
+            .await
+            .expect("responses response");
+        assert_eq!(responses_res.status(), StatusCode::OK);
+        let responses_headers = last_headers
+            .lock()
+            .expect("lock upstream headers")
+            .clone()
+            .expect("upstream should receive responses headers");
+        assert_common_copilot_headers(&responses_headers);
+    }
+
+    #[tokio::test]
+    async fn streams_chat_completions_without_buffering() {
+        let (upstream, _last_body, _last_headers) = start_upstream().await;
+        let yaml = r#"
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: github_copilot/gpt-4o-2024-11-20
+"#;
+        let config = AppConfig::from_yaml_str(yaml).expect("parse config");
+        let app = build_proxy_router(
+            config,
+            upstream,
+            vec![],
+            Arc::new(StaticApiKeyProvider::new("proxy-api-key")),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("proxy server run");
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt-4o",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .expect("send request");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("text/event-stream"))
+        );
+
+        let mut body = resp.bytes_stream();
+        let start = Instant::now();
+        let first_chunk = tokio::time::timeout(Duration::from_millis(150), body.next())
+            .await
+            .expect("first stream chunk timed out")
+            .expect("first stream chunk missing")
+            .expect("first stream chunk error");
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "first chunk arrived too late, likely buffered"
+        );
+        assert!(String::from_utf8_lossy(&first_chunk).contains("data:"));
+    }
+
+    #[tokio::test]
+    async fn streams_responses_without_buffering() {
+        let (upstream, _last_body, _last_headers) = start_upstream().await;
+        let yaml = r#"
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: github_copilot/gpt-4o-2024-11-20
+"#;
+        let config = AppConfig::from_yaml_str(yaml).expect("parse config");
+        let app = build_proxy_router(
+            config,
+            upstream,
+            vec![],
+            Arc::new(StaticApiKeyProvider::new("proxy-api-key")),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("proxy server run");
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "model": "gpt-4o",
+                "stream": true,
+                "input": "hello"
+            }))
+            .send()
+            .await
+            .expect("send request");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("text/event-stream"))
+        );
+
+        let mut body = resp.bytes_stream();
+        let start = Instant::now();
+        let first_chunk = tokio::time::timeout(Duration::from_millis(150), body.next())
+            .await
+            .expect("first stream chunk timed out")
+            .expect("first stream chunk missing")
+            .expect("first stream chunk error");
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "first chunk arrived too late, likely buffered"
+        );
+        assert!(String::from_utf8_lossy(&first_chunk).contains("data:"));
     }
 }
